@@ -1,0 +1,227 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: student-mail-merge-v1.6.0
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Prepare Flutter platforms
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Android and Windows platform files
+        run: |
+          flutter create --platforms=android,windows --org com.mographiccode --project-name student_mail_merge .
+          rm -f test/widget_test.dart
+
+      - name: Commit generated platform files if needed
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add android windows .metadata
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: add generated Flutter platform files [skip ci]"
+            git push origin HEAD:main
+          else
+            echo "Platform files already exist."
+          fi
+
+  android:
+    name: Build Android APK
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-warnings
+
+      - name: Test
+        run: flutter test --reporter expanded
+
+      - name: Build APK
+        run: flutter build apk --release
+
+      - name: Rename APK
+        run: cp build/app/outputs/flutter-apk/app-release.apk Student-Mail-Merge-v1.6.0.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Student-Mail-Merge-v1.6.0-APK
+          path: Student-Mail-Merge-v1.6.0.apk
+          if-no-files-found: error
+
+  windows:
+    name: Build Windows Installer
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - name: Checkout latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-warnings
+
+      - name: Test
+        run: flutter test --reporter expanded
+
+      - name: Build Windows
+        run: flutter build windows --release
+
+      - name: Verify runtime files
+        shell: pwsh
+        run: |
+          $release = "build/windows/x64/runner/Release"
+          foreach ($item in @("student_mail_merge.exe", "flutter_windows.dll", "data")) {
+            if (-not (Test-Path (Join-Path $release $item))) {
+              throw "Missing required runtime file: $item"
+            }
+          }
+
+      - name: Create portable ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath Student-Mail-Merge-Windows-Portable-v1.6.0.zip -Force
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build Windows Installer
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer\student_mail_merge.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup compilation failed."
+          }
+
+      - name: Smoke test installed application
+        shell: pwsh
+        run: |
+          $installer = Resolve-Path "installer-output\Student-Mail-Merge-Windows-Installer-v1.6.0.exe"
+          $installDir = Join-Path $env:RUNNER_TEMP "StudentMailMergeInstalled"
+
+          $p = Start-Process $installer -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/DIR=$installDir"
+          ) -Wait -PassThru
+
+          if ($p.ExitCode -ne 0) {
+            throw "Installer returned exit code $($p.ExitCode)"
+          }
+
+          foreach ($item in @("student_mail_merge.exe", "flutter_windows.dll", "data")) {
+            if (-not (Test-Path (Join-Path $installDir $item))) {
+              throw "Installer did not install required runtime file: $item"
+            }
+          }
+
+          $app = Start-Process (Join-Path $installDir "student_mail_merge.exe") -PassThru
+          Start-Sleep -Seconds 6
+
+          if ($app.HasExited) {
+            throw "Installed application exited during startup with code $($app.ExitCode)"
+          }
+
+          Stop-Process -Id $app.Id -Force
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Student-Mail-Merge-v1.6.0-Windows-Installer
+          path: installer-output/Student-Mail-Merge-Windows-Installer-v1.6.0.exe
+          if-no-files-found: error
+
+      - name: Upload Windows portable
+        uses: actions/upload-artifact@v4
+        with:
+          name: Student-Mail-Merge-v1.6.0-Windows-Portable
+          path: Student-Mail-Merge-Windows-Portable-v1.6.0.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish Public GitHub Release
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: Student-Mail-Merge-v1.6.0-APK
+          path: release
+
+      - name: Download Windows installer
+        uses: actions/download-artifact@v4
+        with:
+          name: Student-Mail-Merge-v1.6.0-Windows-Installer
+          path: release
+
+      - name: Download Windows portable
+        uses: actions/download-artifact@v4
+        with:
+          name: Student-Mail-Merge-v1.6.0-Windows-Portable
+          path: release
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release delete v1.6.0 --yes --cleanup-tag 2>/dev/null || true
+          gh release create v1.6.0             release/Student-Mail-Merge-v1.6.0.apk             release/Student-Mail-Merge-Windows-Installer-v1.6.0.exe             release/Student-Mail-Merge-Windows-Portable-v1.6.0.zip             --target main             --title "Student Mail Merge v1.6.0"             --notes "Excel + Word student-card mail merge for Android and Windows. Optional balanced committees with Arabic labels. تصميم وبرمجة: م.محمود دغَبس — 774813824."
